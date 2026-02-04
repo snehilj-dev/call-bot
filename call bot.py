@@ -1,16 +1,22 @@
-import asyncio, base64, json, audioop, time, os, re
+import asyncio, base64, io, json, logging, audioop, time, os, re, wave
 from openai import AsyncOpenAI
 import aiohttp
 from aiohttp import web, ClientSession
 
 # ----------------------------
+# Logging (so Render logs show what's happening)
+# ----------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
+
+# ----------------------------
 # CONFIG
 # ----------------------------
-#"YOUR_DEEPGRAM_KEY"
-DEEPGRAM_KEY = "90332867e648b106891fe713035830598993b4df"
+DEEPGRAM_KEY = os.environ.get("DEEPGRAM_KEY", "90332867e648b106891fe713035830598993b4df")
 DEEPGRAM_WS_URL = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")  # or "gpt-4o" for stronger reasoning
+LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+TTS_SERVER_URL = os.environ.get("TTS_SERVER_URL", "").rstrip("/")  # e.g. http://localhost:9000 for Qwen TTS
 
 # ----------------------------
 # Helpers: Twilio <-> audio
@@ -34,15 +40,69 @@ async def twilio_clear(twilio_ws, streamSid: str):
     await twilio_ws.send(json.dumps({"event": "clear", "streamSid": streamSid}))
 
 # ----------------------------
-# TTS: placeholder
+# TTS: Qwen server -> OpenAI fallback -> silence (so call never fails silently)
 # Return PCM16 audio bytes + sample_rate (e.g., 24000)
 # ----------------------------
+def _wav_bytes_to_pcm16_sr(wav_bytes: bytes) -> tuple[bytes, int]:
+    """Extract PCM16 and sample rate from WAV bytes."""
+    buf = io.BytesIO(wav_bytes)
+    with wave.open(buf, "rb") as w:
+        nch = w.getnchannels()
+        width = w.getsampwidth()
+        sr = w.getframerate()
+        frames = w.readframes(w.getnframes())
+    if width != 2 or nch != 1:
+        # convert to mono 16-bit if needed (simplified: take first channel and hope)
+        raise ValueError(f"Unsupported WAV: nch={nch} sampwidth={width}")
+    return (frames, sr)
+
+
 async def qwen3_tts_pcm16(text: str, instruct: str) -> tuple[bytes, int]:
     """
-    Replace this with your real Qwen3-TTS call.
-    Must return linear PCM 16-bit little-endian bytes and its sample rate.
+    Try: (1) TTS_SERVER_URL (Qwen), (2) OpenAI TTS, (3) 0.5s silence.
+    Returns (pcm16_bytes, sample_rate).
     """
-    raise NotImplementedError
+    # 1) Qwen TTS server (your tts_server.py)
+    if TTS_SERVER_URL and text.strip():
+        try:
+            async with ClientSession() as session:
+                async with session.post(
+                    f"{TTS_SERVER_URL}/tts",
+                    json={"text": text, "instruct": instruct or "Neutral, clear.", "format": "wav"},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status == 200:
+                        wav_bytes = await resp.read()
+                        if len(wav_bytes) > 44:
+                            pcm, sr = _wav_bytes_to_pcm16_sr(wav_bytes)
+                            log.info("TTS: Qwen server OK len=%s sr=%s", len(pcm), sr)
+                            return (pcm, sr)
+        except Exception as e:
+            log.warning("TTS Qwen server failed: %s", e, exc_info=False)
+
+    # 2) OpenAI TTS (PCM 24k)
+    if OPENAI_API_KEY and text.strip():
+        try:
+            client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+            resp = await client.audio.speech.create(
+                model="tts-1",
+                voice="alloy",
+                input=text[:4096],
+                response_format="pcm",
+                speed=1.0,
+            )
+            pcm_bytes = resp.content
+            if pcm_bytes:
+                # OpenAI PCM is 24kHz 16-bit mono
+                log.info("TTS: OpenAI OK len=%s", len(pcm_bytes))
+                return (pcm_bytes, 24000)
+        except Exception as e:
+            log.warning("TTS OpenAI failed: %s", e, exc_info=False)
+
+    # 3) Silence so pipeline doesn't crash; user sees in logs that TTS is not configured
+    log.warning("TTS: no server and no OpenAI key (or both failed). Playing 0.5s silence. Set TTS_SERVER_URL or OPENAI_API_KEY.")
+    silence_8k = 8000 * 1 * 2  # 0.5s mono 16-bit at 8kHz
+    return (b"\x00" * silence_8k, 8000)
 
 def pcm16_to_mulaw8k(pcm16: bytes, src_rate: int) -> bytes:
     """
@@ -225,100 +285,132 @@ class CallContext:
 async def bridge_twilio_deepgram(twilio_ws):
     ctx = CallContext()
     streamSid = None
+    log.info("Call started: bridge_twilio_deepgram entered")
 
-    # Connect to Deepgram STT (aiohttp client so we can send Authorization header; websockets lib has 3.13 bug)
-    dg_headers = {"Authorization": f"Token {DEEPGRAM_KEY}"}
-    async with ClientSession() as session:
-        async with session.ws_connect(DEEPGRAM_WS_URL, headers=dg_headers) as dg_ws:
+    try:
+        dg_headers = {"Authorization": f"Token {DEEPGRAM_KEY}"}
+        async with ClientSession() as session:
+            async with session.ws_connect(DEEPGRAM_WS_URL, headers=dg_headers) as dg_ws:
+                log.info("Deepgram WebSocket connected")
 
-            async def receive_twilio():
-                nonlocal streamSid
-                async for raw in twilio_ws:
-                    msg = json.loads(raw)
-                    ev = msg.get("event")
+                async def receive_twilio():
+                    nonlocal streamSid
+                    try:
+                        async for raw in twilio_ws:
+                            try:
+                                msg = json.loads(raw)
+                            except json.JSONDecodeError as e:
+                                log.warning("Twilio: invalid JSON %s", e)
+                                continue
+                            ev = msg.get("event")
+                            if ev == "start":
+                                streamSid = (msg.get("start") or {}).get("streamSid")
+                                log.info("Twilio stream started streamSid=%s", streamSid)
+                            elif ev == "media":
+                                try:
+                                    payload = (msg.get("media") or {}).get("payload")
+                                    if payload:
+                                        audio = b64_to_bytes(payload)
+                                        await dg_ws.send_bytes(audio)
+                                except Exception as e:
+                                    log.warning("Twilio media send failed: %s", e)
+                                ctx.last_user_speech_ts = time.time()
+                                if ctx.is_speaking and streamSid:
+                                    try:
+                                        await twilio_clear(twilio_ws, streamSid)
+                                    except Exception as e:
+                                        log.warning("Twilio clear failed: %s", e)
+                                    ctx.is_speaking = False
+                            elif ev == "stop":
+                                log.info("Twilio stream stop")
+                                break
+                    except Exception as e:
+                        log.exception("receive_twilio error: %s", e)
 
-                    if ev == "start":
-                        streamSid = msg["start"]["streamSid"]
+                async def receive_deepgram_and_respond():
+                    nonlocal streamSid
+                    try:
+                        async for msg in dg_ws:
+                            if msg.type != aiohttp.WSMsgType.TEXT:
+                                if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
+                                    log.info("Deepgram WS closed or error")
+                                    break
+                                continue
+                            try:
+                                dg = json.loads(msg.data)
+                            except json.JSONDecodeError:
+                                continue
+                            # Deepgram: support both "channel" and "type":"Results" shapes; use is_final or speech_final
+                            channel = dg.get("channel")
+                            if not channel:
+                                continue
+                            alts = (channel.get("alternatives") or [])
+                            if not alts:
+                                continue
+                            alt = alts[0] if isinstance(alts[0], dict) else {}
+                            transcript = (alt.get("transcript") or "").strip()
+                            if not transcript:
+                                continue
+                            is_final = dg.get("is_final", False) or dg.get("speech_final", False)
+                            if not is_final:
+                                continue
 
-                    elif ev == "media":
-                        # Inbound caller audio (mulaw 8k) -> Deepgram
-                        payload = msg["media"]["payload"]
-                        audio = b64_to_bytes(payload)
-                        await dg_ws.send_bytes(audio)
+                            user_text = transcript
+                            log.info("User said: %s", user_text[:200])
 
-                        # Barge-in detection heuristic: if user audio while we speak, interrupt
-                        ctx.last_user_speech_ts = time.time()
-                        if ctx.is_speaking and streamSid:
-                            await twilio_clear(twilio_ws, streamSid)
-                            ctx.is_speaking = False  # stop current agent output
+                            ctx.call_phase = "middle"
+                            if ctx.call_state == "greeting":
+                                ctx.call_state = "troubleshooting"
 
-                    elif ev == "stop":
-                        break
+                            try:
+                                plan = await llm_plan_style(
+                                    call_state=ctx.call_state,
+                                    sentiment=ctx.sentiment,
+                                    risk_flags=ctx.risk_flags,
+                                    call_phase=ctx.call_phase,
+                                    user_text=user_text,
+                                )
+                            except Exception as e:
+                                log.exception("LLM failed: %s", e)
+                                plan = {
+                                    "reply": "I'm having trouble right now. Can you say that again?",
+                                    "segments": [{"text": "I'm having trouble. Can you say that again?", "style": {}}],
+                                }
 
-            async def receive_deepgram_and_respond():
-                nonlocal streamSid
-                buffer_text = ""
+                            reply_preview = (plan.get("reply") or "")[:150]
+                            log.info("Reply: %s", reply_preview)
 
-                async for msg in dg_ws:
-                    if msg.type != aiohttp.WSMsgType.TEXT:
-                        if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
-                            break
-                        continue
-                    raw = msg.data
-                    dg = json.loads(raw)
+                            if not streamSid:
+                                continue
 
-                    # Deepgram message shapes vary; look for final transcript fields in your chosen API mode.
-                    if "channel" not in dg:
-                        continue
+                            segments = plan.get("segments") or []
+                            for seg in segments:
+                                if time.time() - ctx.last_user_speech_ts < 0.4:
+                                    break
+                                text = (seg.get("text") or "").strip()
+                                if not text:
+                                    continue
+                                try:
+                                    instruct = style_to_instruct(seg.get("style") or {})
+                                    pcm16, sr = await qwen3_tts_pcm16(text, instruct)
+                                    mulaw = pcm16_to_mulaw8k(pcm16, sr)
+                                    ctx.is_speaking = True
+                                    await twilio_send_media(twilio_ws, streamSid, mulaw)
+                                    gap = int((seg.get("style") or {}).get("gap_ms_after", 200))
+                                    gap = max(0, min(2000, gap))
+                                    await asyncio.sleep(gap / 1000.0)
+                                except Exception as e:
+                                    log.exception("TTS or send_media failed for segment %r: %s", text[:50], e)
+                                finally:
+                                    ctx.is_speaking = False
+                    except Exception as e:
+                        log.exception("receive_deepgram_and_respond error: %s", e)
 
-                    alt = dg["channel"]["alternatives"][0]
-                    transcript = alt.get("transcript", "").strip()
-                    if not transcript:
-                        continue
-
-                    is_final = dg.get("is_final", False)
-                    if not is_final:
-                        continue
-
-                    user_text = transcript  # final utterance
-
-                    # Update state machine (simple example)
-                    ctx.call_phase = "middle"
-                    if ctx.call_state == "greeting":
-                        ctx.call_state = "troubleshooting"
-
-                    # Ask LLM for plan
-                    plan = await llm_plan_style(
-                        call_state=ctx.call_state,
-                        sentiment=ctx.sentiment,
-                        risk_flags=ctx.risk_flags,
-                        call_phase=ctx.call_phase,
-                        user_text=user_text
-                    )
-
-                    # Speak segments with dynamic styles
-                    if not streamSid:
-                        continue
-
-                    for seg in plan["segments"]:
-                        # If user barged in recently, stop speaking
-                        if time.time() - ctx.last_user_speech_ts < 0.4:
-                            break
-
-                        instruct = style_to_instruct(seg["style"])
-                        pcm16, sr = await qwen3_tts_pcm16(seg["text"], instruct)
-                        mulaw = pcm16_to_mulaw8k(pcm16, sr)
-
-                        ctx.is_speaking = True
-                        await twilio_send_media(twilio_ws, streamSid, mulaw)
-
-                        # Gap control (dynamic pause)
-                        gap = int(seg["style"].get("gap_ms_after", 200))
-                        await asyncio.sleep(gap / 1000.0)
-
-                    ctx.is_speaking = False
-
-            await asyncio.gather(receive_twilio(), receive_deepgram_and_respond())
+                await asyncio.gather(receive_twilio(), receive_deepgram_and_respond())
+    except Exception as e:
+        log.exception("bridge_twilio_deepgram failed: %s", e)
+    finally:
+        log.info("Call ended: bridge_twilio_deepgram exiting")
 
 # ----------------------------
 # HTTP + WebSocket server (health checks use GET/HEAD; websockets library rejects HEAD)
@@ -353,7 +445,11 @@ async def health(_request: web.Request) -> web.Response:
 async def ws_twilio(request: web.Request) -> web.WebSocketResponse:
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-    await bridge_twilio_deepgram(_AiohttpWsAdapter(ws))
+    log.info("WebSocket /ws/twilio connected")
+    try:
+        await bridge_twilio_deepgram(_AiohttpWsAdapter(ws))
+    except Exception as e:
+        log.exception("ws_twilio handler error: %s", e)
     return ws
 
 
