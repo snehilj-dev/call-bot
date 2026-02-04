@@ -358,8 +358,7 @@ def main():
     port = int(os.environ.get("PORT", "8080"))
     print(f"Binding to 0.0.0.0:{port} (PORT={os.environ.get('PORT', '8080')})", flush=True)
     app = web.Application()
-    app.router.add_get("/", health)
-    app.router.add_head("/", health)
+    app.router.add_get("/", health)  # aiohttp serves HEAD for GET routes automatically
     app.router.add_get("/ws/twilio", ws_twilio)
     web.run_app(app, host="0.0.0.0", port=port)
 
