@@ -9,7 +9,7 @@ from aiohttp import web
 # ----------------------------
 #"YOUR_DEEPGRAM_KEY"
 DEEPGRAM_KEY = "90332867e648b106891fe713035830598993b4df"
-DEEPGRAM_WS_URL = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000"
+DEEPGRAM_WS_BASE = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")  # or "gpt-4o" for stronger reasoning
 
@@ -227,9 +227,9 @@ async def bridge_twilio_deepgram(twilio_ws):
     ctx = CallContext()
     streamSid = None
 
-    # Connect to Deepgram STT
-    dg_headers = {"Authorization": f"Token {DEEPGRAM_KEY}"}
-    async with connect(DEEPGRAM_WS_URL, extra_headers=dg_headers) as dg_ws:
+    # Connect to Deepgram STT (auth via token= to avoid extra_headers + Python 3.13 asyncio bug)
+    dg_url = f"{DEEPGRAM_WS_BASE}&token={DEEPGRAM_KEY}"
+    async with connect(dg_url) as dg_ws:
 
         async def receive_twilio():
             nonlocal streamSid
