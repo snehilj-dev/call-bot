@@ -1,3 +1,4 @@
 websockets
 httpx
-# plus deepgram sdk if you use it
+openai
+audioop-lts
