@@ -1,15 +1,14 @@
 import asyncio, base64, json, audioop, time, os, re
-from websockets import connect
 from openai import AsyncOpenAI
 import aiohttp
-from aiohttp import web
+from aiohttp import web, ClientSession
 
 # ----------------------------
 # CONFIG
 # ----------------------------
 #"YOUR_DEEPGRAM_KEY"
 DEEPGRAM_KEY = "90332867e648b106891fe713035830598993b4df"
-DEEPGRAM_WS_BASE = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000"
+DEEPGRAM_WS_URL = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")  # or "gpt-4o" for stronger reasoning
 
@@ -227,95 +226,99 @@ async def bridge_twilio_deepgram(twilio_ws):
     ctx = CallContext()
     streamSid = None
 
-    # Connect to Deepgram STT (auth via token= to avoid extra_headers + Python 3.13 asyncio bug)
-    dg_url = f"{DEEPGRAM_WS_BASE}&token={DEEPGRAM_KEY}"
-    async with connect(dg_url) as dg_ws:
+    # Connect to Deepgram STT (aiohttp client so we can send Authorization header; websockets lib has 3.13 bug)
+    dg_headers = {"Authorization": f"Token {DEEPGRAM_KEY}"}
+    async with ClientSession() as session:
+        async with session.ws_connect(DEEPGRAM_WS_URL, headers=dg_headers) as dg_ws:
 
-        async def receive_twilio():
-            nonlocal streamSid
-            async for raw in twilio_ws:
-                msg = json.loads(raw)
-                ev = msg.get("event")
+            async def receive_twilio():
+                nonlocal streamSid
+                async for raw in twilio_ws:
+                    msg = json.loads(raw)
+                    ev = msg.get("event")
 
-                if ev == "start":
-                    streamSid = msg["start"]["streamSid"]
+                    if ev == "start":
+                        streamSid = msg["start"]["streamSid"]
 
-                elif ev == "media":
-                    # Inbound caller audio (mulaw 8k) -> Deepgram
-                    payload = msg["media"]["payload"]
-                    audio = b64_to_bytes(payload)
-                    await dg_ws.send(audio)
+                    elif ev == "media":
+                        # Inbound caller audio (mulaw 8k) -> Deepgram
+                        payload = msg["media"]["payload"]
+                        audio = b64_to_bytes(payload)
+                        await dg_ws.send_bytes(audio)
 
-                    # Barge-in detection heuristic:
-                    # if user audio is arriving while we are speaking, interrupt
-                    ctx.last_user_speech_ts = time.time()
-                    if ctx.is_speaking and streamSid:
-                        await twilio_clear(twilio_ws, streamSid)
-                        ctx.is_speaking = False  # stop current agent output
+                        # Barge-in detection heuristic: if user audio while we speak, interrupt
+                        ctx.last_user_speech_ts = time.time()
+                        if ctx.is_speaking and streamSid:
+                            await twilio_clear(twilio_ws, streamSid)
+                            ctx.is_speaking = False  # stop current agent output
 
-                elif ev == "stop":
-                    break
-
-        async def receive_deepgram_and_respond():
-            nonlocal streamSid
-            buffer_text = ""
-
-            async for raw in dg_ws:
-                dg = json.loads(raw)
-
-                # Deepgram message shapes vary; look for final transcript fields in your chosen API mode.
-                # Here we assume dg["channel"]["alternatives"][0]["transcript"] and dg["is_final"]
-                if "channel" not in dg: 
-                    continue
-
-                alt = dg["channel"]["alternatives"][0]
-                transcript = alt.get("transcript", "").strip()
-                if not transcript:
-                    continue
-
-                is_final = dg.get("is_final", False)
-                if not is_final:
-                    continue
-
-                user_text = transcript  # final utterance
-
-                # Update state machine (simple example)
-                ctx.call_phase = "middle"
-                if ctx.call_state == "greeting":
-                    ctx.call_state = "troubleshooting"
-
-                # Ask LLM for plan
-                plan = await llm_plan_style(
-                    call_state=ctx.call_state,
-                    sentiment=ctx.sentiment,
-                    risk_flags=ctx.risk_flags,
-                    call_phase=ctx.call_phase,
-                    user_text=user_text
-                )
-
-                # Speak segments with dynamic styles
-                if not streamSid:
-                    continue
-
-                for seg in plan["segments"]:
-                    # If user barged in recently, stop speaking
-                    if time.time() - ctx.last_user_speech_ts < 0.4:
+                    elif ev == "stop":
                         break
 
-                    instruct = style_to_instruct(seg["style"])
-                    pcm16, sr = await qwen3_tts_pcm16(seg["text"], instruct)
-                    mulaw = pcm16_to_mulaw8k(pcm16, sr)
+            async def receive_deepgram_and_respond():
+                nonlocal streamSid
+                buffer_text = ""
 
-                    ctx.is_speaking = True
-                    await twilio_send_media(twilio_ws, streamSid, mulaw)
+                async for msg in dg_ws:
+                    if msg.type != aiohttp.WSMsgType.TEXT:
+                        if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
+                            break
+                        continue
+                    raw = msg.data
+                    dg = json.loads(raw)
 
-                    # Gap control (dynamic pause)
-                    gap = int(seg["style"].get("gap_ms_after", 200))
-                    await asyncio.sleep(gap / 1000.0)
+                    # Deepgram message shapes vary; look for final transcript fields in your chosen API mode.
+                    if "channel" not in dg:
+                        continue
 
-                ctx.is_speaking = False
+                    alt = dg["channel"]["alternatives"][0]
+                    transcript = alt.get("transcript", "").strip()
+                    if not transcript:
+                        continue
 
-        await asyncio.gather(receive_twilio(), receive_deepgram_and_respond())
+                    is_final = dg.get("is_final", False)
+                    if not is_final:
+                        continue
+
+                    user_text = transcript  # final utterance
+
+                    # Update state machine (simple example)
+                    ctx.call_phase = "middle"
+                    if ctx.call_state == "greeting":
+                        ctx.call_state = "troubleshooting"
+
+                    # Ask LLM for plan
+                    plan = await llm_plan_style(
+                        call_state=ctx.call_state,
+                        sentiment=ctx.sentiment,
+                        risk_flags=ctx.risk_flags,
+                        call_phase=ctx.call_phase,
+                        user_text=user_text
+                    )
+
+                    # Speak segments with dynamic styles
+                    if not streamSid:
+                        continue
+
+                    for seg in plan["segments"]:
+                        # If user barged in recently, stop speaking
+                        if time.time() - ctx.last_user_speech_ts < 0.4:
+                            break
+
+                        instruct = style_to_instruct(seg["style"])
+                        pcm16, sr = await qwen3_tts_pcm16(seg["text"], instruct)
+                        mulaw = pcm16_to_mulaw8k(pcm16, sr)
+
+                        ctx.is_speaking = True
+                        await twilio_send_media(twilio_ws, streamSid, mulaw)
+
+                        # Gap control (dynamic pause)
+                        gap = int(seg["style"].get("gap_ms_after", 200))
+                        await asyncio.sleep(gap / 1000.0)
+
+                    ctx.is_speaking = False
+
+            await asyncio.gather(receive_twilio(), receive_deepgram_and_respond())
 
 # ----------------------------
 # HTTP + WebSocket server (health checks use GET/HEAD; websockets library rejects HEAD)
