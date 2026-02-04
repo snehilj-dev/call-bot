@@ -356,6 +356,7 @@ async def ws_twilio(request: web.Request) -> web.WebSocketResponse:
 
 def main():
     port = int(os.environ.get("PORT", "8080"))
+    print(f"Binding to 0.0.0.0:{port} (PORT={os.environ.get('PORT', '8080')})", flush=True)
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_head("/", health)
