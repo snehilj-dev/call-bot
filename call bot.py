@@ -1,6 +1,8 @@
 import asyncio, base64, json, audioop, time, os, re
-from websockets import connect, serve
+from websockets import connect
 from openai import AsyncOpenAI
+import aiohttp
+from aiohttp import web
 
 # ----------------------------
 # CONFIG
@@ -315,19 +317,51 @@ async def bridge_twilio_deepgram(twilio_ws):
 
         await asyncio.gather(receive_twilio(), receive_deepgram_and_respond())
 
-async def ws_handler(websocket, path):
-    if path != "/ws/twilio":
-        await websocket.close()
-        return
-    await bridge_twilio_deepgram(websocket)
+# ----------------------------
+# HTTP + WebSocket server (health checks use GET/HEAD; websockets library rejects HEAD)
+# ----------------------------
+class _AiohttpWsAdapter:
+    """Wrap aiohttp WebSocket so it matches the interface bridge_twilio_deepgram expects."""
+    def __init__(self, ws: web.WebSocketResponse):
+        self._ws = ws
 
-async def ws_handler(twilio_ws):
-    await bridge_twilio_deepgram(twilio_ws)
+    async def send(self, data: str):
+        await self._ws.send_str(data)
 
-async def main():
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        msg = await self._ws.receive()
+        if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
+            raise StopAsyncIteration
+        if msg.type == aiohttp.WSMsgType.TEXT:
+            return msg.data
+        if msg.type == aiohttp.WSMsgType.BINARY:
+            return msg.data.decode("utf-8", errors="replace")
+        raise StopAsyncIteration
+
+
+async def health(_request: web.Request) -> web.Response:
+    """Render and load balancers send GET/HEAD to /; respond 200 so health checks pass."""
+    return web.Response(text="ok", status=200)
+
+
+async def ws_twilio(request: web.Request) -> web.WebSocketResponse:
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    await bridge_twilio_deepgram(_AiohttpWsAdapter(ws))
+    return ws
+
+
+def main():
     port = int(os.environ.get("PORT", "8080"))
-    async with serve(ws_handler, "0.0.0.0", port):
-        await asyncio.Future()
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_head("/", health)
+    app.router.add_get("/ws/twilio", ws_twilio)
+    web.run_app(app, host="0.0.0.0", port=port)
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

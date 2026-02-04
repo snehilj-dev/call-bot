@@ -2,3 +2,4 @@ websockets
 httpx
 openai
 audioop-lts
+aiohttp
